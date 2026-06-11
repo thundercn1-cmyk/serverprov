@@ -1,0 +1,469 @@
+name: Techno Serverless CI/CD Pipeline
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: Skip test jobs
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+  APP_NAME: techno-codedeploy-app
+  DEPLOYMENT_GROUP: techno-codedeploy-group
+
+jobs:
+
+  # ─── JOB 1: Track fork ───────────────────────────────────────
+  track-and-notify-owner:
+    name: Track Repository
+    runs-on: ubuntu-latest
+    outputs:
+      is_fork: ${{ steps.check_fork.outputs.is_fork }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check fork
+        id: check_fork
+        run: |
+          IS_FORK="${{ github.event.repository.fork }}"
+          echo "is_fork=$IS_FORK" >> $GITHUB_OUTPUT
+          echo "Repo: ${{ github.repository }} | Fork: $IS_FORK | Actor: ${{ github.actor }}"
+
+      - name: Configure AWS credentials
+        if: steps.check_fork.outputs.is_fork == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Notify fork via SNS
+        if: steps.check_fork.outputs.is_fork == 'true'
+        continue-on-error: true
+        run: |
+          aws sns publish \
+            --topic-arn "${{ secrets.SNS_TOPIC_ARN }}" \
+            --subject "Fork Detected: ${{ github.repository }}" \
+            --message "Fork by ${{ github.actor }} on ${{ github.repository }} commit ${{ github.sha }}" \
+            --region ${{ env.AWS_REGION }} \
+            || echo "WARN: SNS publish gagal (SCP restriction di AWS Academy)"
+
+      - name: Log pipeline start
+        run: |
+          echo "Pipeline started by ${{ github.actor }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref_name }}"
+
+  # ─── JOB 2: Test ─────────────────────────────────────────────
+  test:
+    name: Test and Lint
+    runs-on: ubuntu-latest
+    needs: track-and-notify-owner
+    if: github.event.inputs.skip_tests != 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install flake8 pyyaml
+
+      - name: Validate Python syntax
+        run: |
+          for f in lambda/*/lambda_function.py; do
+            python -m py_compile "$f" && echo "OK: $f"
+          done
+
+      - name: Run flake8
+        run: |
+          flake8 lambda/ --count --select=E9,F63,F7,F82 --show-source --statistics
+          echo "Linting passed"
+
+      - name: Validate AppSpec
+        run: |
+          test -f codedeploy/appspec.yml || (echo "appspec.yml not found" && exit 1)
+          grep -q "Resources" codedeploy/appspec.yml || (echo "Resources missing" && exit 1)
+          grep -q "Alias" codedeploy/appspec.yml || (echo "Alias missing" && exit 1)
+          echo "AppSpec valid"
+
+      - name: Validate Frontend HTML
+        run: |
+          python -c "
+          from html.parser import HTMLParser
+          with open('frontend/index.html') as f:
+              src = f.read()
+          HTMLParser().feed(src)
+          print('HTML valid, size:', len(src), 'bytes')
+          "
+
+  # ─── JOB 3: Deploy 6 Lambda (update alias langsung) ─────────
+  deploy-lambda:
+    name: Deploy Lambda ${{ matrix.function.name }}
+    runs-on: ubuntu-latest
+    needs: [track-and-notify-owner, test]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    strategy:
+      max-parallel: 3
+      fail-fast: false
+      matrix:
+        function:
+          - { name: process-payment,   dir: process_payment   }
+          - { name: update-inventory,  dir: update_inventory  }
+          - { name: send-notification, dir: send_notification }
+          - { name: generate-report,   dir: generate_report   }
+          - { name: init-db,           dir: init_db           }
+          - { name: health-check,      dir: health_check      }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package Lambda zip
+        run: |
+          FUNC_NAME="techno-lambda-${{ matrix.function.name }}"
+          echo "FUNC_NAME=$FUNC_NAME" >> $GITHUB_ENV
+          cd lambda/${{ matrix.function.dir }}
+          zip -q /tmp/${FUNC_NAME}.zip lambda_function.py
+
+      - name: Update Lambda code
+        run: |
+          aws lambda update-function-code \
+            --function-name "$FUNC_NAME" \
+            --zip-file "fileb:///tmp/${FUNC_NAME}.zip" \
+            --region ${{ env.AWS_REGION }} \
+            --no-cli-pager
+          aws lambda wait function-updated \
+            --function-name "$FUNC_NAME" \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Publish version and update alias
+        run: |
+          VERSION=$(aws lambda publish-version \
+            --function-name "$FUNC_NAME" \
+            --description "sha=${{ github.sha }}" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Version' --output text --no-cli-pager)
+          echo "Published version: $VERSION"
+          ALIAS_EXISTS=$(aws lambda get-alias \
+            --function-name "$FUNC_NAME" \
+            --name live \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Name' --output text --no-cli-pager 2>/dev/null || echo "NOT_FOUND")
+          if [ "$ALIAS_EXISTS" = "live" ]; then
+            aws lambda update-alias \
+              --function-name "$FUNC_NAME" \
+              --name live \
+              --function-version "$VERSION" \
+              --region ${{ env.AWS_REGION }} \
+              --no-cli-pager
+            echo "Alias 'live' updated to v$VERSION for $FUNC_NAME"
+          else
+            aws lambda create-alias \
+              --function-name "$FUNC_NAME" \
+              --name live \
+              --function-version "$VERSION" \
+              --region ${{ env.AWS_REGION }} \
+              --no-cli-pager
+            echo "Alias 'live' created v$VERSION for $FUNC_NAME"
+          fi
+
+  # ─── JOB 4: Deploy order-management via CodeDeploy (Blue/Green)
+  deploy-bluegreen:
+    name: Deploy order-management (Blue/Green CodeDeploy)
+    runs-on: ubuntu-latest
+    needs: [track-and-notify-owner, test]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Package Lambda zip
+        run: |
+          cd lambda/order_management
+          zip -q /tmp/techno-lambda-order-management.zip lambda_function.py
+          echo "Packaged order-management"
+
+      - name: Update Lambda code
+        run: |
+          aws lambda update-function-code \
+            --function-name techno-lambda-order-management \
+            --zip-file "fileb:///tmp/techno-lambda-order-management.zip" \
+            --region ${{ env.AWS_REGION }} \
+            --no-cli-pager
+          aws lambda wait function-updated \
+            --function-name techno-lambda-order-management \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Publish Lambda version
+        id: publish
+        run: |
+          VERSION=$(aws lambda publish-version \
+            --function-name techno-lambda-order-management \
+            --description "sha=${{ github.sha }}" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Version' --output text --no-cli-pager)
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Published version: $VERSION"
+
+      - name: Get current alias version (Blue)
+        id: blue
+        run: |
+          CURRENT=$(aws lambda get-alias \
+            --function-name techno-lambda-order-management \
+            --name live \
+            --region ${{ env.AWS_REGION }} \
+            --query 'FunctionVersion' --output text --no-cli-pager 2>/dev/null || echo "1")
+          echo "CURRENT=$CURRENT" >> $GITHUB_OUTPUT
+          echo "Blue=$CURRENT Green=${{ steps.publish.outputs.VERSION }}"
+
+      - name: Create AppSpec and CodeDeploy deployment (Canary Blue/Green)
+        id: codedeploy
+        run: |
+          CUR="${{ steps.blue.outputs.CURRENT }}"
+          TGT="${{ steps.publish.outputs.VERSION }}"
+
+          # Tulis appspec.json pakai printf (compact, no spaces)
+          printf '{"version":0.0,"Resources":[{"techno-lambda-order-management":{"Type":"AWS::Lambda::Function","Properties":{"Name":"techno-lambda-order-management","Alias":"live","CurrentVersion":"%s","TargetVersion":"%s"}}}]}'             "$CUR" "$TGT" > /tmp/appspec.json
+          echo "AppSpec: $(cat /tmp/appspec.json)"
+          APPSPEC_SHA=$(sha256sum /tmp/appspec.json | cut -d' ' -f1)
+
+          # Stop deployment aktif jika ada
+          ACTIVE=$(aws deploy list-deployments             --application-name "$APP_NAME"             --deployment-group-name "$DEPLOYMENT_GROUP"             --include-only-statuses InProgress Created Ready             --region ${{ env.AWS_REGION }}             --query 'deployments[0]' --output text --no-cli-pager 2>/dev/null || echo "None")
+          if [ "$ACTIVE" != "None" ] && [ -n "$ACTIVE" ]; then
+            echo "Stopping active deployment: $ACTIVE"
+            aws deploy stop-deployment               --deployment-id "$ACTIVE"               --auto-rollback-enabled               --region ${{ env.AWS_REGION }}               --no-cli-pager || true
+            sleep 5
+          fi
+
+          # Gunakan jq untuk build codedeploy_input.json — hindari heredoc Python di YAML
+          # jq sudah tersedia di semua ubuntu-latest GitHub Actions runner
+          jq -n             --arg app  "$APP_NAME"             --arg dg   "$DEPLOYMENT_GROUP"             --arg sha  "$APPSPEC_SHA"             --arg ver  "$TGT"             --rawfile content /tmp/appspec.json             '{
+              applicationName: $app,
+              deploymentGroupName: $dg,
+              deploymentConfigName: "CodeDeployDefault.LambdaCanary10Percent5Minutes",
+              revision: {
+                revisionType: "AppSpecContent",
+                appSpecContent: { content: $content, sha256: $sha }
+              },
+              description: ("Blue/Green order-management v" + $ver)
+            }' > /tmp/codedeploy_input.json
+
+          echo "--- codedeploy_input.json ---"
+          cat /tmp/codedeploy_input.json
+
+          DEPLOYMENT_ID=$(aws deploy create-deployment             --cli-input-json file:///tmp/codedeploy_input.json             --region ${{ env.AWS_REGION }}             --query 'deploymentId' --output text --no-cli-pager)
+          echo "DEPLOYMENT_ID=$DEPLOYMENT_ID" >> $GITHUB_OUTPUT
+          echo "CodeDeploy Deployment: $DEPLOYMENT_ID"
+
+      - name: Wait for CodeDeploy deployment
+        run: |
+          echo "Canary 10% traffic for 5 minutes..."
+          aws deploy wait deployment-successful \
+            --deployment-id "${{ steps.codedeploy.outputs.DEPLOYMENT_ID }}" \
+            --region ${{ env.AWS_REGION }}
+          echo "Blue/Green deployment successful!"
+
+  # ─── JOB 5: Deploy Frontend via Amplify (manual zip deploy) ──
+  # Amplify app dibuat secara manual (zip upload), bukan connected ke Git.
+  # Wajib pakai create-deployment + start-deployment, BUKAN start-job.
+  deploy-frontend:
+    name: Deploy Frontend via Amplify
+    runs-on: ubuntu-latest
+    needs: [deploy-lambda, deploy-bluegreen]
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate frontend files
+        run: |
+          test -f frontend/index.html && echo "index.html OK"
+          ls -lh frontend/
+
+      - name: Package frontend zip
+        run: |
+          cd frontend
+          zip -q /tmp/frontend.zip index.html
+          ls -lh /tmp/frontend.zip
+
+      - name: Deploy to Amplify (create-deployment + start-deployment)
+        id: amplify
+        run: |
+          APP_ID="${{ secrets.AMPLIFY_APP_ID }}"
+          BRANCH="main"
+
+          # Pastikan branch ada
+          aws amplify create-branch \
+            --app-id "$APP_ID" \
+            --branch-name "$BRANCH" \
+            --region ${{ env.AWS_REGION }} \
+            --no-cli-pager 2>/dev/null || true
+
+          # Stop semua job yang masih running/pending sebelum buat deployment baru
+          echo "Checking for running jobs..."
+          RUNNING_JOBS=$(aws amplify list-jobs \
+            --app-id "$APP_ID" \
+            --branch-name "$BRANCH" \
+            --region ${{ env.AWS_REGION }} \
+            --max-results 10 \
+            --query 'jobSummaries[?status==`RUNNING` || status==`PENDING`].jobId' \
+            --output text --no-cli-pager 2>/dev/null || echo "")
+          for JID in $RUNNING_JOBS; do
+            echo "  Stopping job: $JID"
+            aws amplify stop-job \
+              --app-id "$APP_ID" \
+              --branch-name "$BRANCH" \
+              --job-id "$JID" \
+              --region ${{ env.AWS_REGION }} \
+              --no-cli-pager 2>/dev/null || true
+          done
+          # Tunggu sampai benar-benar tidak ada job yang running
+          for i in $(seq 1 20); do
+            STILL_RUNNING=$(aws amplify list-jobs \
+              --app-id "$APP_ID" \
+              --branch-name "$BRANCH" \
+              --region ${{ env.AWS_REGION }} \
+              --max-results 5 \
+              --query 'jobSummaries[?status==`RUNNING` || status==`PENDING`].jobId' \
+              --output text --no-cli-pager 2>/dev/null || echo "")
+            if [ -z "$STILL_RUNNING" ] || [ "$STILL_RUNNING" = "None" ]; then
+              echo "  No running jobs, proceeding..."
+              break
+            fi
+            echo "  [$i/20] Still running: $STILL_RUNNING — waiting 5s..."
+            sleep 5
+          done
+
+          # create-deployment → dapat zipUploadUrl + jobId
+          DEPLOY_RESP=$(aws amplify create-deployment \
+            --app-id "$APP_ID" \
+            --branch-name "$BRANCH" \
+            --region ${{ env.AWS_REGION }} \
+            --output json)
+
+          UPLOAD_URL=$(echo "$DEPLOY_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['zipUploadUrl'])")
+          JOB_ID=$(echo      "$DEPLOY_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['jobId'])")
+          echo "JOB_ID=$JOB_ID" >> $GITHUB_OUTPUT
+          echo "Got jobId=$JOB_ID, uploading zip..."
+
+          # Upload zip via PUT ke pre-signed URL
+          HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
+            -X PUT "$UPLOAD_URL" \
+            -H "Content-Type: application/zip" \
+            --data-binary @/tmp/frontend.zip)
+          echo "Upload HTTP status: $HTTP_CODE"
+          [ "$HTTP_CODE" = "200" ] || (echo "Upload failed: $HTTP_CODE" && exit 1)
+
+          # start-deployment dengan jobId dari create-deployment
+          aws amplify start-deployment \
+            --app-id "$APP_ID" \
+            --branch-name "$BRANCH" \
+            --job-id "$JOB_ID" \
+            --region ${{ env.AWS_REGION }} \
+            --no-cli-pager
+          echo "Deployment started: job $JOB_ID"
+
+      - name: Wait for Amplify deployment
+        run: |
+          APP_ID="${{ secrets.AMPLIFY_APP_ID }}"
+          BRANCH="main"
+          JOB_ID="${{ steps.amplify.outputs.JOB_ID }}"
+          echo "Waiting for job $JOB_ID..."
+          for i in $(seq 1 30); do
+            STATUS=$(aws amplify get-job \
+              --app-id "$APP_ID" \
+              --branch-name "$BRANCH" \
+              --job-id "$JOB_ID" \
+              --region ${{ env.AWS_REGION }} \
+              --query 'job.summary.status' --output text --no-cli-pager)
+            echo "[$i/30] Status: $STATUS"
+            if [ "$STATUS" = "SUCCEED" ]; then
+              DOMAIN=$(aws amplify get-app \
+                --app-id "$APP_ID" \
+                --region ${{ env.AWS_REGION }} \
+                --query 'app.defaultDomain' --output text --no-cli-pager 2>/dev/null || echo "")
+              echo "Frontend URL: https://${BRANCH}.${DOMAIN}"
+              exit 0
+            fi
+            if [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CANCELLED" ]; then
+              echo "Amplify deployment $STATUS"
+              aws amplify get-job \
+                --app-id "$APP_ID" \
+                --branch-name "$BRANCH" \
+                --job-id "$JOB_ID" \
+                --region ${{ env.AWS_REGION }} \
+                --query 'job.steps[?status==`FAILED`].[stepName,statusReason]' \
+                --output table --no-cli-pager 2>/dev/null || true
+              exit 1
+            fi
+            sleep 15
+          done
+          echo "Timeout waiting for Amplify"
+          exit 1
+
+  # ─── JOB 6: Notify ───────────────────────────────────────────
+  notify:
+    name: Send Deployment Notification
+    runs-on: ubuntu-latest
+    needs: [deploy-lambda, deploy-bluegreen, deploy-frontend]
+    if: always() && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Send SNS notification
+        # continue-on-error: SNS:Publish bisa diblok SCP di AWS Academy (voclabs role).
+        # Policy topic sudah diset di judge.sh step 4, tapi SCP bisa override.
+        # Job tetap "success" meski SNS gagal — notifikasi tidak menentukan deploy berhasil.
+        continue-on-error: true
+        run: |
+          LAMBDA_RESULT="${{ needs.deploy-lambda.result }}"
+          BG_RESULT="${{ needs.deploy-bluegreen.result }}"
+          FRONTEND_RESULT="${{ needs.deploy-frontend.result }}"
+          if [ "$LAMBDA_RESULT" = "success" ] && [ "$BG_RESULT" = "success" ] && [ "$FRONTEND_RESULT" = "success" ]; then
+            STATUS="SUCCESS"
+          else
+            STATUS="FAILED"
+          fi
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          aws sns publish \
+            --topic-arn "${{ secrets.SNS_TOPIC_ARN }}" \
+            --subject "Deploy ${STATUS} - techno-serverless" \
+            --message "Status=${STATUS} Commit=${{ github.sha }} Actor=${{ github.actor }} Branch=${{ github.ref_name }} Time=${TIMESTAMP} Lambda(6fn)=${LAMBDA_RESULT} BlueGreen(order-mgmt)=${BG_RESULT} Frontend=${FRONTEND_RESULT} Run=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --region ${{ env.AWS_REGION }} \
+            --no-cli-pager \
+            && echo "Notification sent - $STATUS" \
+            || echo "WARN: SNS publish gagal (SCP restriction di AWS Academy) — deploy tetap dianggap berhasil"
